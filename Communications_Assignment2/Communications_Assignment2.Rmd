@@ -1,0 +1,372 @@
+---
+title: "**Building on Broken Ground**: Why Boston’s TOD Vision Can’t Ignore Redlining"
+author: "Emma Witanowski"
+date: 'September, 2024'
+output: 
+  html_document:
+    theme: united
+    highlight: espresso
+    fig_width: 10
+    fig_height: 7
+    code_folding: hide
+    toc: true
+    toc_float: true
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup_packages, warning = FALSE, message = FALSE}
+# Load Libraries & Census Key
+
+library(groundhog)
+groundhog.library("tidyverse", "2024-09-22")
+groundhog.library("tidycensus", "2024-09-22")
+groundhog.library("sf", "2024-09-22")
+groundhog.library("kableExtra", "2024-09-22")
+groundhog.library("mapview", "2024-09-22")
+groundhog.library("ggspatial", "2024-09-22")
+groundhog.library("viridis", "2024-09-22")
+groundhog.library("viridisLite", "2024-09-22")
+groundhog.library("knitr", "2024-09-22")
+
+options(scipen=999)
+options(tigris_class = "sf")
+
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+census_api_key("2303009ddac130ce0b80796be79521a5421131c9", overwrite = TRUE)
+```
+
+The past couple of decades has marked the flourishment of **Transit Orientated Development** (TOD) in the city of Boston, MA [^1^](https://www.bostonplans.org/planning-zoning/planning-initiatives/fostering-transit). The primary aim of this development is to create “vibrant, livable, sustainable communities” [^2^](http://tod.org), fostering compact, walkable cities centered around public transit. While the idea sounds like an ideal solution for creating a more accessible future, benefit will not be equitable. The harsh reality--*TOD will struggle to deliver on these promises until Boston addresses the scars left by historically-rooted redlining.*
+
+```{r message=FALSE, warning=FALSE, cache=TRUE, results='hide'}
+#Getting and formatting Tracts for Boston
+
+#2012, ACS-5 Year
+tracts12 <-  
+  get_acs(geography = "tract",
+          variables = c("B01003_001E","B02001_002E",
+                        "B15001_050E","B15001_009E",
+                        "B19013_001E", "B25058_001E",
+                        "B06012_002E"), 
+          year=2012, state="MA",
+          county="Suffolk", survey="acs5", geometry=TRUE) %>% 
+  st_transform('EPSG:2249')
+
+#Remove tract in the water
+tracts12_filtered <- tracts12 %>%
+  filter(GEOID != "25025990101")
+
+tracts12_filtered <- 
+  tracts12_filtered %>%
+  dplyr::select( -NAME, -moe) %>%
+  spread(key = variable, value = estimate) %>%
+  rename(TotalPop = B01003_001, 
+         Whites = B02001_002,
+         FemaleBachelors = B15001_050, 
+         MaleBachelors = B15001_009,
+         MedHHInc = B19013_001, 
+         MedRent = B25058_001,
+         TotalPoverty = B06012_002)
+
+tracts12_filtered <- 
+  tracts12_filtered %>%
+  mutate(pctWhite = ifelse(TotalPop > 0, Whites / TotalPop, 0),
+         pctBachelors = ifelse(TotalPop > 0, ((FemaleBachelors + MaleBachelors) / TotalPop), 0),
+         pctPoverty = ifelse(TotalPop > 0, TotalPoverty / TotalPop, 0),
+         year = "2012") %>%
+  dplyr::select(-Whites,-FemaleBachelors,-MaleBachelors,-TotalPoverty)
+
+#2022, ACS-5 Year
+tracts22 <- 
+  get_acs(geography = "tract", 
+          variables = c("B01003_001E","B02001_002E",
+                        "B15001_050E","B15001_009E",
+                        "B19013_001E","B25058_001E",
+                        "B06012_002E"), 
+          year=2022, 
+          state=25, 
+          county=25, 
+          survey="acs5",
+          geometry=TRUE,
+          output="wide") %>%
+  st_transform('EPSG:2249') %>%
+  rename(TotalPop = B01003_001E, 
+         Whites = B02001_002E,
+         FemaleBachelors = B15001_050E, 
+         MaleBachelors = B15001_009E,
+         MedHHInc = B19013_001E, 
+         MedRent = B25058_001E,
+         TotalPoverty = B06012_002E) %>%
+  dplyr::select(-NAME, -starts_with("B")) %>%
+  mutate(pctWhite = ifelse(TotalPop > 0, Whites / TotalPop,0),
+         pctBachelors = ifelse(TotalPop > 0, ((FemaleBachelors + MaleBachelors) / TotalPop),0),
+         pctPoverty = ifelse(TotalPop > 0, TotalPoverty / TotalPop, 0),
+         year = "2022") %>%
+  dplyr::select(-Whites, -FemaleBachelors, -MaleBachelors, -TotalPoverty) 
+
+#Combining both years
+allTracts2012_22 <- rbind(tracts12_filtered,tracts22)
+
+
+#Boston Transit Stops Data Wrangling
+
+MBTA_Transit_Stops <- st_read("https://arcgisserver.digital.mass.gov/arcgisserver/rest/services/AGOL/MBTA_Rapid_Transit/MapServer/1/query?outFields=*&where=1%3D1&f=geojson")
+
+MBTA_Stops <- MBTA_Transit_Stops %>%
+      dplyr::select(STATION, LINE, ROUTE) %>% st_transform(st_crs(allTracts2012_22))  
+
+MBTA_Stops_clipped <- st_intersection(MBTA_Stops, allTracts2012_22)
+
+
+#Buffer Data
+
+MBTA_stopBuffer <- st_buffer(MBTA_Stops_clipped, 2640)
+
+MBTA_stopUnion <- st_union(st_buffer(MBTA_Stops_clipped, 2640))
+
+MBTA_Buffers <- 
+  rbind(
+     MBTA_stopBuffer %>%
+      mutate(Legend = "Buffer") %>%
+      dplyr::select(Legend),
+     MBTA_stopUnion %>%
+      st_sf() %>%
+      mutate(Legend = "Unioned Buffer"))
+
+buffer_MBTA <- filter(MBTA_Buffers, Legend=="Unioned Buffer")
+
+clip <- 
+  st_intersection(buffer_MBTA, allTracts2012_22) %>%
+  dplyr::select(TotalPop) %>%
+  mutate(Selection_Type = "Clip")
+
+
+#Spatial selection
+
+# approach #1: sub-setting a spatial object with a spatial object using the '[' brackets.
+selection1 <- 
+  allTracts2012_22[buffer_MBTA,] %>%
+  dplyr::select(TotalPop) %>%
+  mutate(Selection_Type = "Spatial Selection")
+
+# approach #2: using `st_intersects` as a verbose way to do approach #1
+selection2 <- allTracts2012_22[st_intersects(allTracts2012_22, buffer_MBTA) %>% lengths > 0, ] %>%
+  dplyr::select(TotalPop) %>%
+  mutate(Selection_Type = "Spatial Selection")
+
+# approach #3: use `st_join` to do a spatial join and remove the non-intersecting polygons
+selection3 <- allTracts2012_22 %>% 
+  st_join(buffer_MBTA, join = st_intersects) %>% 
+  filter(!is.na(Legend)) %>% 
+  dplyr::select(TotalPop) %>%
+  mutate(Selection_Type = "Spatial Intersects")
+
+selectCentroids <-
+  st_centroid(allTracts2012_22)[buffer_MBTA,] %>%
+  st_drop_geometry() %>%
+  left_join(., dplyr::select(allTracts2012_22, GEOID), by = "GEOID") %>%
+  st_sf() %>%
+  dplyr::select(TotalPop) %>%
+  mutate(Selection_Type = "Select by Centroids")
+
+intersections <- rbind(clip, selection1, selectCentroids)
+
+
+#Getting summarizing data
+
+MBTA_allTracts.group <- 
+  rbind(
+    st_centroid(allTracts2012_22)[buffer_MBTA,] %>%
+      st_drop_geometry() %>%
+      left_join(allTracts2012_22) %>%
+      st_sf() %>%
+      mutate(TOD = "TOD"),
+    st_centroid(allTracts2012_22)[buffer_MBTA, op = st_disjoint] %>%
+      st_drop_geometry() %>%
+      left_join(allTracts2012_22) %>%
+      st_sf() %>%
+      mutate(TOD = "Non-TOD")) %>%
+  mutate(MedRent.inf = ifelse(year == "2012", MedRent * 1.28, MedRent)) %>% #Using September 2012 v 2022
+  mutate(WhitePCT100 = pctWhite * 100) %>%
+  mutate(PovertyPCT100 = pctPoverty * 100) %>%
+  mutate(BachelorsPCT100 = pctBachelors * 100) %>%
+  mutate(MedHHInc.inf = ifelse(year == "2012", MedHHInc * 1.28, MedHHInc)) #Using September 2012 v 2022
+
+#For table, bar graph, & plots
+Boston_Summary <- 
+  st_drop_geometry(MBTA_allTracts.group) %>%
+  group_by(year, TOD) %>%
+  summarize(Rent = mean(MedRent.inf, na.rm = T),
+            Population = mean(TotalPop, na.rm = T),
+            Percent_White = mean(WhitePCT100, na.rm = T),
+            #Percent_Bach = mean(BachelorsPCT100, na.rm = T),
+            Percent_Poverty = mean(PovertyPCT100, na.rm = T),
+            Income = mean(MedHHInc.inf, na.rm = T))
+
+```
+
+*** 
+
+## The Shadows of Redlining
+
+The racially segregating process of redlining dates back to the 1930’s, as a result of housing shortages post the Great Depression. To aid in the access to affordable home mortgages, the **Home Owners’ Loan Corporation** (HOLC) and the **Federal Housing Administration** (FHA) were established to help stabilize the unsteady state of the market. The FHA made color-coated neighborhood maps of 239 US cities, denoting which areas were investment risks for federally-backed loans[^3^](https://storymaps.arcgis.com/stories/bd15a5eb9eae49cda09bfa7368272f89). 
+
+
+HOLC appraisers sectioned of neighborhoods into four color-coded graded sections: “**A**, Best (green);” “**B**, Still desirable (blue);” “**C**, Definitely declining (yellow);” and “**D**, Hazardous (red).”[^3^](https://storymaps.arcgis.com/stories/bd15a5eb9eae49cda09bfa7368272f89). 
+
+
+These drawn boundaries were radically motivated. Primarily, “A” areas were those with dense white and high-income populations, while those marked “D” denoted areas compromised of racial minorities, lower-socioeconomic and immigrant individuals.[^3^](https://storymaps.arcgis.com/stories/bd15a5eb9eae49cda09bfa7368272f89).  Residents in D-graded (and even C) neighborhoods were systematically denied granted loans and mortgages for homes, leaving them stranded and deprived of homeownership and investments.
+
+\
+
+##### *Boston was one of the many cities who fell victim to this practice*. 
+
+```{r}
+
+knitr::include_graphics("https://github.com/emmawita/MUSA6310-301_Assignment2/blob/7a0dcf01471e8c21bb2341f891ee4e0106026043/figures/Bostons-Redlining-Map-Source-33.png?raw=true")
+
+```
+
+\
+\
+
+*Many neighborhoods’ demographic compositions still align with the historical boundaries of redlining.* Dorchester, Mattapan, Mission Hill, and Roxbury in lower-central Boston remain predominately black neighborhoods.
+
+``` {r}
+
+knitr::include_graphics("https://github.com/emmawita/MUSA6310-301_Assignment2/blob/7a0dcf01471e8c21bb2341f891ee4e0106026043/figures/boston-race-density.png?raw=true")
+
+```
+
+\
+\
+
+And, like in most cities, the legacy these redlined communities (referring to the red-color associated with D-grade) continues to linger, widening the gap between equally opportunities.
+
+***
+
+## A Continued History of Exclusion
+
+The majority of transit routes and stop are concentrated along central and northeastern portion of Boston and intersect many redlined communities. Development in the city, historically, has been centered around transit lines, and contemporarily, the large share of housing and jobs are located within proximity to transit[^4^](https://www.mass.gov/files/documents/2017/10/17/TOD_Policy.pdf). Approximately 25 and 37% of housing units and employment (in 2012), respectively, fall within half-mile radius of rapid transit or commuter rail station[^5^](ttps://www.mapc.org/wp-content/uploads/2020/02/MAPC-TOD-Report-FINAL-web-reduced-size.pdf). Now, with current TOD, the city has a chance to change the landscape—but without addressing this history, the future could look starkly similar to the past.
+
+\ 
+
+#### However, current trends illustrate a continual pressure on historically overlooked neighborhoods. 
+
+\
+
+One of the many benefits of TOD concerns bolstering the local economy, in the form of attracting businesses and providing access to better jobs[^2^](http://tod.org). 
+
+Yet, poverty rates within these many of TOD-redlined neighborhoods remain high. Between 2012 and 2022 poverty rates in TOD areas (and the greater Boston) decreased by **18.64%**, but rates continued to be greatest specifically in lower-central Boston (even in tracts that fall within a half-mile boundary of TOD). 
+
+```{r echo=TRUE, warning=FALSE, cache=FALSE, message=FALSE}
+
+ ggplot(MBTA_allTracts.group)+
+    geom_sf(data = st_union(tracts12_filtered), color = NA)+
+    geom_sf(aes(fill = q5(PovertyPCT100)), color = NA) +
+    geom_sf(data = buffer_MBTA, fill = "white", alpha = 0.4, color = "snow3", lwd = .5)+
+    scale_fill_viridis_d(option = "E",
+                      labels = qBr(MBTA_allTracts.group, "PovertyPCT100"),
+                      name = "Percent Poverty\n(Quintile Breaks)",
+                      guide = guide_legend(nrow = 1)) +
+    labs(title = "Percentage of Poverty by Tract", subtitle = "%, 2012-2022", caption = "Data: US Census Bureau, ACS 5-year estimates; Outline shows TOD radius.") +
+    facet_wrap(~year)+
+  theme_void()+
+    theme(plot.title = element_text(color = "gray12", size=18, hjust = 0.5, vjust = 2.25, face = "bold", family = "mono"),
+          plot.subtitle = element_text(color = "gray12", hjust = 0.5, vjust = 4, face = "italic", family = "mono"),
+          plot.caption = element_text(color = "snow3", face = "italic", size = 6, hjust = 0.5, family = "mono"),
+          strip.text.x.top = element_text(colour = "snow4", face = "bold.italic", size = 10, hjust = .5, family = "mono"),
+          legend.title = element_text(color = "gray12", family = "mono", hjust = 0.5, size = 8), legend.title.position = "top",
+          legend.text = element_text(color = "gray12", family = "mono", face = "italic", size = 6, vjust = 4, hjust = 0.5),
+          legend.position = "bottom", legend.text.position = "bottom", legend.key.height = unit(0.25, "cm"))
+
+```
+
+Income rates followed similar patterns. TOD areas experienced a great increase in average income (**37.71%**), where TOD-redlined neighborhoods, and those within proximity, still have a generally lower average income. 
+
+```{r echo=TRUE, warning=FALSE, cache=FALSE, message=FALSE}
+
+ggplot(MBTA_allTracts.group)+
+    geom_sf(data = st_union(tracts12_filtered), color = NA)+
+    geom_sf(aes(fill = q5(MedHHInc)), color = NA) +
+    geom_sf(data = buffer_MBTA, fill = "white", alpha = 0.4, color = "snow3", lwd = .5)+
+    scale_fill_viridis_d(option = "G",
+                      labels = qBr(MBTA_allTracts.group, "MedHHInc"),
+                      name = "Income\n(Quintile Breaks)",
+                      guide = guide_legend(nrow = 1),
+                      na.translate = FALSE) +
+    labs(title = "Median Income by Tract", subtitle = "$ USD, 2012-2022", caption = "Data: US Census Bureau, ACS 5-year estimates; Outline shows TOD radius.") +
+    facet_wrap(~year)+
+  theme_void()+
+    theme(plot.title = element_text(color = "gray12", size=18, hjust = 0.5, vjust = 2.25, face = "bold", family = "mono"),
+          plot.subtitle = element_text(color = "gray12", hjust = 0.5, vjust = 4, face = "italic", family = "mono"),
+          plot.caption = element_text(color = "snow3", face = "italic", size = 6, hjust = 0.5, family = "mono"),
+          strip.text.x.top = element_text(colour = "snow4", face = "bold.italic", size = 10, hjust = .5, family = "mono"),
+          legend.title = element_text(color = "gray12", family = "mono", hjust = 0.5, size = 8), legend.title.position = "top",
+          legend.text = element_text(color = "gray12", family = "mono", face = "italic", size = 6, vjust = 4, hjust = 0.5),
+          legend.position = "bottom", legend.text.position = "bottom", legend.key.height = unit(0.25, "cm"))
+```
+
+As TOD becomes more desirable, especially for residents, an inevitable consequence is enhanced demand coupled with increase rent prices. Boston is no exception and prices nearby TOD greatly rose between 2012 and 2022. 
+
+```{r echo=TRUE, warning=FALSE, cache=FALSE, message=FALSE}
+
+#Graduated Symbols, Population
+station_data2 <- st_intersection(allTracts2012_22, MBTA_stopBuffer) %>% 
+  group_by(STATION, year) %>%
+  summarize(
+    Population = mean(TotalPop, na.rm = TRUE),
+    MeanRent = mean(MedRent, na.rm = TRUE),
+    geometry = st_union(geometry)
+  ) %>%
+  st_centroid()  
+
+#Graduated Symbol, Rent
+quantile_breaks <- quantile(station_data2$MeanRent, probs = seq(0, 1, length.out = 5), na.rm = TRUE)
+
+station_data2 <- station_data2 %>%
+  filter(!is.na(MeanRent))
+
+ggplot() +
+  geom_sf(data = allTracts2012_22, fill = "snow2", color = "snow3", lwd = 0.05) +
+  geom_sf(data = station_data2, aes(size = MeanRent, color = MeanRent), alpha = 0.6) +
+  scale_size_continuous(name = "Mean Rent ($ USD)",
+                        breaks = quantile_breaks,  # Use quantile breaks
+                        labels = scales::comma,
+                        guide = guide_legend(nrow = 1)) +
+  scale_color_viridis(option = "F",
+                      name = "Mean Rent",
+                      breaks = quantile_breaks,
+                      labels = scales::comma,
+                      guide = guide_legend(nrow = 1)) +
+  labs(title = "Mean Rent, 2012-2022",
+       subtitle = "within 0.5 mi of MBTA Station",
+       caption = "Data: US Census Bureau, ACS 5-year estimates.") +
+  facet_wrap(~year)+
+  theme_void()+
+    theme(plot.title = element_text(color = "gray12", size=18, hjust = 0.5, vjust = 2.25, face = "bold", family = "mono"),
+          plot.subtitle = element_text(color = "gray15", hjust = 0.5, vjust = 4, face = "italic", family = "mono"),
+          plot.caption = element_text(color = "snow3", face = "italic", size = 6, hjust = 0.5, family = "mono"),
+          strip.text.x.top = element_text(colour = "snow4", face = "bold.italic", size = 10, hjust = .5, family = "mono"), 
+          legend.title = element_text(color = "gray12", family = "mono", hjust = 0.5, size = 8), legend.title.position = "top",
+          legend.text = element_text(color = "gray12", family = "mono", face = "italic", size = 6, vjust = 4, hjust = 0.5), 
+          legend.position = "bottom", legend.text.position = "bottom", legend.key.height = unit(0.25, "cm"))  +
+  guides(size = guide_legend("Mean Rent ($ USD)"), color = guide_legend("Mean Rent ($ USD)"))
+```
+
+***
+
+## Establishing Equality With TOD
+
+The current trajectory of TOD is hinting towards displacement and gentrification of these historically marginalized individuals in TOD boundaries and within proximity. Communities that were denied investment for decades are now being pushed out when economic prosperity comes. 
+
+Lower-socioeconomic individuals are more likely to utilized public transit as commute to work and in daily use[^6^](https://journals.sagepub.com/doi/full/10.1177/0739456X20950428). Now, they are being forced to move farther from the transit systems they’ve relied on for generations. This hinders their chances of social mobility, which has already been suppressed. TOD is meant to aid individuals who depend on transit, yet benefits are not equitable. If Boston fails to tackle the root causes of these inequities, TOD risks continuing the same cycles of exclusion and inequality. 
+
+\
+
+*Boston has the opportunity to rectify past injustices and build a more inclusive future.* However, it is imperative that the city recognizes and confronts redlining-induced segregation and take action to protect current vulnerable communities. 
+
